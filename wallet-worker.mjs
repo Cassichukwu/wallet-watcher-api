@@ -3,7 +3,7 @@ const ETHERSCAN_BASE = "https://api.etherscan.io/v2/api";
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
 
 function jsonResponse(data, status = 200) {
@@ -118,10 +118,81 @@ Rules: risk_level must be low/medium/high. Be concise. No investment advice. Ret
 
   const data = await response.json();
   if (!response.ok) throw new Error(JSON.stringify(data.error));
-  
+
   const text = data.content[0].text.trim();
   const clean = text.replace(/^```(?:json)?\n?/m, "").replace(/\n?```$/m, "").trim();
   return JSON.parse(clean);
+}
+
+async function sendEmailAlert(email, walletAddress, report, resendApiKey) {
+  const highAlerts = report.alerts.filter(a => a.risk_level === "high");
+  const mediumAlerts = report.alerts.filter(a => a.risk_level === "medium");
+
+  const alertsHtml = report.alerts.map(alert => `
+    <div style="margin: 12px 0; padding: 12px; border-radius: 8px; background: ${
+      alert.risk_level === "high" ? "#fff0f0" :
+      alert.risk_level === "medium" ? "#fffbf0" : "#f0fff4"
+    }; border-left: 4px solid ${
+      alert.risk_level === "high" ? "#e53e3e" :
+      alert.risk_level === "medium" ? "#d69e2e" : "#38a169"
+    }">
+      <div style="font-weight: bold; text-transform: uppercase; font-size: 11px; color: ${
+        alert.risk_level === "high" ? "#e53e3e" :
+        alert.risk_level === "medium" ? "#d69e2e" : "#38a169"
+      }">${alert.risk_level} risk</div>
+      <div style="font-weight: 600; margin: 4px 0;">${alert.event}</div>
+      <div style="font-size: 14px; color: #555;">${alert.why_it_matters}</div>
+      <div style="font-size: 13px; color: #333; margin-top: 6px;"><strong>Action:</strong> ${alert.recommended_action}</div>
+    </div>
+  `).join("");
+
+  const emailBody = `
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+      <div style="background: #0a0f1e; padding: 24px; border-radius: 12px 12px 0 0;">
+        <h1 style="color: #00d4ff; margin: 0; font-size: 22px;">👁️ Wallet Watcher Copilot</h1>
+        <p style="color: #8899aa; margin: 4px 0 0;">Risk Alert Report</p>
+      </div>
+      <div style="padding: 24px; background: #f8f9fa; border-radius: 0 0 12px 12px;">
+        <p style="color: #333;"><strong>Wallet:</strong> ${walletAddress}</p>
+        <p style="color: #333;"><strong>Summary:</strong> ${report.one_line_summary}</p>
+        
+        <h3 style="color: #333; margin-top: 20px;">Risk Alerts (${report.alerts.length})</h3>
+        ${alertsHtml}
+        
+        <div style="margin-top: 20px; padding: 12px; background: #e8f4fd; border-radius: 8px;">
+          <p style="margin: 0; color: #555; font-size: 13px;">${report.portfolio_snapshot}</p>
+        </div>
+        
+        <div style="margin-top: 20px; text-align: center;">
+          <a href="https://coin-calm-dashboard.lovable.app" 
+             style="background: #00d4ff; color: #0a0f1e; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: bold;">
+            View Full Report
+          </a>
+        </div>
+        
+        <p style="color: #999; font-size: 12px; margin-top: 20px; text-align: center;">
+          Wallet Watcher Copilot — AI-powered wallet monitoring
+        </p>
+      </div>
+    </div>
+  `;
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${resendApiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: "Wallet Watcher <onboarding@resend.dev>",
+      to: [email],
+      subject: `⚠️ Wallet Alert: ${highAlerts.length > 0 ? highAlerts.length + " HIGH risk" : mediumAlerts.length + " medium risk"} detected`,
+      html: emailBody,
+    }),
+  });
+
+  const data = await res.json();
+  return { success: res.ok, id: data.id, error: data.message };
 }
 
 export default {
@@ -129,23 +200,25 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
-  return new Response(null, { 
-    status: 204,
-    headers: {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "*",
-      "Access-Control-Max-Age": "86400",
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "*",
+          "Access-Control-Max-Age": "86400",
+        }
+      });
     }
-  });
-}
 
     if (url.pathname === "/health") {
       return jsonResponse({ status: "ok", timestamp: new Date().toISOString() });
     }
 
+    // GET /api/wallet-report?address=0x...&email=user@example.com
     if (url.pathname === "/api/wallet-report" && request.method === "GET") {
       const address = url.searchParams.get("address");
+      const email = url.searchParams.get("email");
 
       if (!address) {
         return jsonResponse({ error: "Wallet address is required" }, 400);
@@ -158,7 +231,33 @@ export default {
       try {
         const walletData = await fetchWalletData(address, env.ETHERSCAN_API_KEY);
         const report = await analyzeWithClaude(walletData, env.ANTHROPIC_API_KEY);
+
+        // Send email if provided and there are alerts
+        if (email && report.alerts && report.alerts.length > 0) {
+          const hasHighOrMedium = report.alerts.some(a => a.risk_level === "high" || a.risk_level === "medium");
+          if (hasHighOrMedium) {
+            await sendEmailAlert(email, address, report, env.RESEND_API_KEY);
+          }
+        }
+
         return jsonResponse(report);
+      } catch (err) {
+        return jsonResponse({ error: err.message }, 500);
+      }
+    }
+
+    // POST /api/send-alert - manual email trigger
+    if (url.pathname === "/api/send-alert" && request.method === "POST") {
+      try {
+        const body = await request.json();
+        const { email, address, report } = body;
+
+        if (!email || !address || !report) {
+          return jsonResponse({ error: "email, address, and report are required" }, 400);
+        }
+
+        const result = await sendEmailAlert(email, address, report, env.RESEND_API_KEY);
+        return jsonResponse(result);
       } catch (err) {
         return jsonResponse({ error: err.message }, 500);
       }

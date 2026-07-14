@@ -1,1 +1,1 @@
-﻿{"name":"wallet-watcher-api","version":"1.0.0","type":"module","main":"server.mjs","scripts":{"start":"node server.mjs"}}
+{"name":"wallet-watcher-api","version":"1.0.0","type":"module","main":"server.mjs","scripts":{"start":"node server.mjs"},"dependencies":{"resend":"^6.17.2"}}
